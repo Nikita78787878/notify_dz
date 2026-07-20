@@ -5,6 +5,10 @@ cookies.json
 last_response.txt
 PS_COOKIE.txt
 
+# логи
+*.log
+watcher.log*
+
 # мусор
 __pycache__/
 *.pyc

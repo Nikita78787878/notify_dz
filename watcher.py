@@ -19,7 +19,8 @@ import hashlib
 import os
 import sys
 import threading
-from datetime import datetime
+import logging
+from logging.handlers import RotatingFileHandler
 
 import requests
 
@@ -29,6 +30,7 @@ CURL_PATH = os.path.join(HERE, "request.curl")
 STATE_PATH = os.path.join(HERE, "seen.json")
 RAWDUMP_PATH = os.path.join(HERE, "last_response.txt")
 COOKIES_PATH = os.path.join(HERE, "cookies.json")
+LOG_PATH = os.path.join(HERE, "watcher.log")
 
 # Единая HTTP-сессия: сама подхватывает свежие куки из ответов сайта
 # (за счёт remember_web ручная замена нужна очень редко).
@@ -38,10 +40,25 @@ SESSION = requests.Session()
 STATE = {"url": None, "method": "GET", "headers": {}, "data": None}
 STATE_LOCK = threading.Lock()
 
+# --- Логирование: в файл с ротацией (5 × 10 МБ) + в консоль/journald ---
+_logger = logging.getLogger("watcher")
+if not _logger.handlers:
+    _logger.setLevel(logging.INFO)
+    _fmt = logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    try:
+        _fh = RotatingFileHandler(LOG_PATH, maxBytes=10 * 1024 * 1024,
+                                  backupCount=5, encoding="utf-8")
+        _fh.setFormatter(_fmt)
+        _logger.addHandler(_fh)
+    except Exception:
+        pass  # если писать в файл нельзя — не падаем, остаётся консоль
+    _sh = logging.StreamHandler(sys.stdout)
+    _sh.setFormatter(_fmt)
+    _logger.addHandler(_sh)
+
 
 def log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    _logger.info(msg)
 
 
 def load_config():
@@ -615,6 +632,9 @@ def main():
         log("ВНИМАНИЕ: стартовое сообщение не ушло ни в один канал — проверь настройки.")
 
     fail_streak = 0
+    idle_ticks = 0
+    # "Без изменений" пишем не каждый раз, а раз в ~N циклов (чтобы не спамить лог)
+    idle_every = max(1, int(600 / max(interval, 1)))  # примерно раз в 10 минут
     while True:
         try:
             resp = fetch()  # берёт актуальный запрос из STATE через сессию
@@ -660,6 +680,7 @@ def main():
 
             new_ids = current_ids - seen
             if new_ids:
+                idle_ticks = 0
                 log(f"🔔 НОВЫХ ЗАДАНИЙ: {len(new_ids)}")
                 for nid in new_ids:
                     title = (titles.get(nid) or "").strip()
@@ -668,7 +689,10 @@ def main():
                     notify(cfg, msg)
                 save_seen(seen | current_ids)
             else:
-                log(f"Без изменений ({len(current_ids)} заданий).")
+                # пишем «всё тихо» редко, чтобы лог не засорять
+                idle_ticks += 1
+                if idle_ticks % idle_every == 0:
+                    log(f"Работаю, без изменений ({len(current_ids)} заданий).")
 
         except requests.RequestException as e:
             log(f"Сетевая ошибка: {e}")
