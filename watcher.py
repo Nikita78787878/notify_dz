@@ -21,8 +21,12 @@ import sys
 import threading
 import logging
 from logging.handlers import RotatingFileHandler
+from datetime import datetime, timezone, timedelta
 
 import requests
+
+# Иркутское время — UTC+8, круглый год (без переходов на летнее время)
+IRKUTSK_TZ = timezone(timedelta(hours=8))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
@@ -41,10 +45,16 @@ STATE = {"url": None, "method": "GET", "headers": {}, "data": None}
 STATE_LOCK = threading.Lock()
 
 # --- Логирование: в файл с ротацией (5 × 10 МБ) + в консоль/journald ---
+def _irkutsk_time(timestamp):
+    """Конвертер времени для логов -> иркутское (UTC+8)."""
+    return datetime.fromtimestamp(timestamp, IRKUTSK_TZ).timetuple()
+
+
 _logger = logging.getLogger("watcher")
 if not _logger.handlers:
     _logger.setLevel(logging.INFO)
-    _fmt = logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    _fmt = logging.Formatter("%(asctime)s (ИРК) %(message)s", "%Y-%m-%d %H:%M:%S")
+    _fmt.converter = _irkutsk_time
     try:
         _fh = RotatingFileHandler(LOG_PATH, maxBytes=10 * 1024 * 1024,
                                   backupCount=5, encoding="utf-8")
