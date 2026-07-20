@@ -1,0 +1,18 @@
+[Unit]
+Description=ProductStar homework watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Папка, куда ты положишь файлы проекта на сервере:
+WorkingDirectory=/opt/homework-watcher
+ExecStart=/usr/bin/python3 /opt/homework-watcher/watcher.py
+Restart=always
+RestartSec=10
+# Чтобы русский текст в логах не ломался:
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
