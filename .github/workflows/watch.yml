@@ -39,12 +39,13 @@ jobs:
 
       - name: Save state
         run: |
-          if [ -n "$(git status --porcelain seen.json)" ]; then
-            git config user.name "watcher-bot"
-            git config user.email "watcher-bot@users.noreply.github.com"
-            git add seen.json
-            git commit -m "update seen state [skip ci]"
-            git push
+          git config user.name "watcher-bot"
+          git config user.email "watcher-bot@users.noreply.github.com"
+          git add -A seen.json heartbeat.txt
+          if git diff --cached --quiet; then
+            echo "нет изменений состояния — коммит не нужен"
           else
-            echo "seen.json без изменений — коммит не нужен"
+            git commit -m "update state [skip ci]"
+            git push
+            echo "состояние сохранено"
           fi

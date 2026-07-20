@@ -15,10 +15,38 @@ import sys
 import json
 
 import re
+from datetime import datetime, timezone
+
 import requests
 import watcher  # переиспользуем разбор и отправку
 
-SEEN_FILE = "seen.json"  # лежит в корне репозитория, коммитится обратно
+SEEN_FILE = "seen.json"          # лежит в корне репозитория, коммитится обратно
+HEARTBEAT_FILE = "heartbeat.txt"  # дата последнего "я на связи"
+
+
+def _today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _set_heartbeat_today():
+    with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+        f.write(_today())
+
+
+def maybe_heartbeat(cfg, count):
+    """Раз в сутки шлёт 'я на связи' (чтобы видеть, что watcher жив)."""
+    last = ""
+    if os.path.exists(HEARTBEAT_FILE):
+        try:
+            with open(HEARTBEAT_FILE, "r", encoding="utf-8") as f:
+                last = f.read().strip()
+        except Exception:
+            pass
+    if last != _today():
+        watcher.notify(cfg, f"✅ Watcher на связи, слежу за домашками ProductStar "
+                            f"(в памяти {count} заданий).")
+        _set_heartbeat_today()
+        print("Отправлен ежедневный heartbeat.", flush=True)
 
 
 def normalize_cookie(raw):
@@ -114,9 +142,12 @@ def main():
     seen = load_seen()
 
     if seen is None:
-        # первый запуск — просто запоминаем, не спамим
+        # первый запуск — запоминаем текущее и шлём подтверждение настройки
         save_seen(set(current))
+        _set_heartbeat_today()
         print(f"Первый запуск. Запомнил {len(current)} заданий.", flush=True)
+        watcher.notify(cfg, f"✅ Watcher запущен. Слежу за новыми домашками "
+                            f"на ProductStar (в памяти {len(current)} заданий).")
         return
 
     new_ids = set(current) - seen
@@ -130,6 +161,9 @@ def main():
         save_seen(seen | set(current))
     else:
         print(f"Без изменений ({len(current)} заданий).", flush=True)
+
+    # раз в сутки — сигнал "я жив"
+    maybe_heartbeat(cfg, len(current))
 
 
 if __name__ == "__main__":
