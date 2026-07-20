@@ -1,0 +1,10 @@
+# СЕКРЕТЫ — НИКОГДА не заливать на GitHub!
+config.json
+request.curl
+cookies.json
+last_response.txt
+PS_COOKIE.txt
+
+# мусор
+__pycache__/
+*.pyc

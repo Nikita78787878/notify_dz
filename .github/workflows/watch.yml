@@ -1,0 +1,50 @@
+name: homework-watcher
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # каждые 5 минут (минимум для GitHub)
+  workflow_dispatch: {}       # кнопка "Run workflow" для ручного запуска
+
+permissions:
+  contents: write             # чтобы сохранять seen.json обратно в репозиторий
+
+concurrency:
+  group: homework-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Check homeworks
+        env:
+          # какие каналы слать: "telegram", "max" или "telegram,max"
+          CHANNELS: ${{ vars.CHANNELS || 'telegram' }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # МАКС — необязательно (может быть недоступен из GitHub/США)
+          MAX_TOKEN: ${{ secrets.MAX_TOKEN }}
+          MAX_CHAT_ID: ${{ secrets.MAX_CHAT_ID }}
+          PS_COOKIE: ${{ secrets.PS_COOKIE }}
+        run: python check_once.py
+
+      - name: Save state
+        run: |
+          if [ -n "$(git status --porcelain seen.json)" ]; then
+            git config user.name "watcher-bot"
+            git config user.email "watcher-bot@users.noreply.github.com"
+            git add seen.json
+            git commit -m "update seen state [skip ci]"
+            git push
+          else
+            echo "seen.json без изменений — коммит не нужен"
+          fi
