@@ -1,9 +1,11 @@
 name: homework-watcher
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'   # каждые 5 минут (минимум для GitHub)
-  workflow_dispatch: {}       # кнопка "Run workflow" для ручного запуска
+  # Автозапуск по расписанию ОТКЛЮЧЁН — слежение работает на VPS.
+  # Чтобы снова включить резерв в Telegram, верни строку schedule ниже.
+  # schedule:
+  #   - cron: '*/5 * * * *'
+  workflow_dispatch: {}       # остаётся только ручной запуск (кнопка Run workflow)
 
 permissions:
   contents: write             # чтобы сохранять seen.json обратно в репозиторий
