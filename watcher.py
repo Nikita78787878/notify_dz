@@ -298,6 +298,14 @@ def _homework_title(hw):
 
     parts = []
 
+    # урок / курс
+    lesson = _dig(hw, "lesson", "name")
+    course = _dig(hw, "course", "name")
+    if lesson:
+        parts.append(f"📝 {lesson}")
+    if course:
+        parts.append(f"📚 {course}")
+
     # студент: student.first_name + student.last_name
     first = _dig(hw, "student", "first_name")
     last = _dig(hw, "student", "last_name")
@@ -305,29 +313,7 @@ def _homework_title(hw):
     if name:
         parts.append(f"👤 {name}")
 
-    # роль студента (напр. «Студент B2C»)
-    role = _dig(hw, "student", "roles", 0, "title") if isinstance(
-        _dig(hw, "student", "roles"), list) and _dig(hw, "student", "roles") else None
-    if role:
-        parts.append(f"🎓 {role}")
-
-    # курс / урок
-    course = _dig(hw, "course", "name")
-    lesson = _dig(hw, "lesson", "name")
-    if course:
-        parts.append(f"📚 {course}")
-    if lesson:
-        parts.append(f"📝 {lesson}")
-
-    # статус (число → текст)
-    status = hw.get("status")
-    if status is not None:
-        parts.append(f"🔖 {STATUS_MAP.get(status, f'статус {status}')}")
-
-    # непрочитанные сообщения / время сдачи
-    unread = hw.get("unreadMessages")
-    if unread:
-        parts.append(f"✉️ Новых сообщений: {unread}")
+    # время сдачи
     when = hw.get("firstSubmission") or hw.get("lastActivity")
     if when:
         parts.append(f"⏰ {when}")
@@ -585,9 +571,6 @@ def build_message(header, title, link):
     lines = [header]
     if title:
         lines.append(title)
-    if link:
-        lines.append("")
-        lines.append(f"Открыть и взять: {link}")
     return "\n".join(lines)
 
 
@@ -695,7 +678,7 @@ def main():
                 for nid in new_ids:
                     title = (titles.get(nid) or "").strip()
                     link = links.get(nid) or page_link
-                    msg = build_message("🔔 Новое домашнее задание!", title, link)
+                    msg = build_message("🔔 Новое", title, link)
                     notify(cfg, msg)
                 save_seen(seen | current_ids)
             else:

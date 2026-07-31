@@ -155,7 +155,7 @@ def main():
         print(f"НОВЫХ ЗАДАНИЙ: {len(new_ids)}", flush=True)
         for nid in new_ids:
             title, link = current[nid]
-            msg = watcher.build_message("🔔 Новое домашнее задание!", title, link or url)
+            msg = watcher.build_message("🔔 Новое", title, link or url)
             ok = watcher.notify(cfg, msg)
             print(f"  уведомил {nid}: {ok}", flush=True)
         save_seen(seen | set(current))
