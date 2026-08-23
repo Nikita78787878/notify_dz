@@ -483,12 +483,16 @@ def notify(cfg, text):
     return ok_any
 
 
-def reply_telegram(cfg, text):
-    """Ответ в Telegram (для команд управления)."""
-    send_telegram(cfg.get("telegram_token"), cfg.get("telegram_chat_id"), text)
+def reply(cfg, text, channel="telegram"):
+    """Ответ на команду — в тот канал, откуда она пришла."""
+    if channel == "max":
+        send_max(cfg.get("max_token"), cfg.get("max_chat_id"), text,
+                 cfg.get("max_api_base"))
+    else:
+        send_telegram(cfg.get("telegram_token"), cfg.get("telegram_chat_id"), text)
 
 
-def update_cookies_from_text(cfg, payload):
+def update_cookies_from_text(cfg, payload, channel="telegram"):
     """
     Обновляет куки одним из двух способов:
       1) прислан полный cURL (есть 'curl'/'http') -> перезаписываем request.curl;
@@ -507,34 +511,34 @@ def update_cookies_from_text(cfg, payload):
             SESSION.cookies.clear()
             apply_request_from_curl()
             save_cookies()
-            reply_telegram(cfg, "✅ Куки обновлены (полный cURL). Продолжаю слежение.")
+            reply(cfg, "✅ Куки обновлены (полный cURL). Продолжаю слежение.", channel)
             log("Куки обновлены через бота (cURL).")
         elif looks_like_cookies:
             SESSION.cookies.clear()
             for k, v in _cookies_from_header(cookie_only).items():
                 SESSION.cookies.set(k, v, domain="hr.productstar.ru")
             save_cookies()
-            reply_telegram(cfg, "✅ Куки обновлены (строка Cookie). Продолжаю слежение.")
+            reply(cfg, "✅ Куки обновлены (строка Cookie). Продолжаю слежение.", channel)
             log("Куки обновлены через бота (cookie-строка).")
         else:
-            reply_telegram(cfg,
+            reply(cfg,
                 "❌ Не распознал. Пришли ОДНО из двух:\n"
                 "• только строку куки: /cookie имя1=знач1; имя2=знач2; ...\n"
-                "• или полный cURL: /cookie curl 'https://...' -b '...'")
+                "• или полный cURL: /cookie curl 'https://...' -b '...'", channel)
     except Exception as e:
-        reply_telegram(cfg, f"❌ Ошибка при обновлении кук: {e}")
+        reply(cfg, f"❌ Ошибка при обновлении кук: {e}", channel)
         log(f"Ошибка обновления кук: {e}")
 
 
-def handle_command(cfg, text):
+def handle_command(cfg, text, channel="telegram"):
     t = (text or "").strip()
     low = t.lower()
     if low.startswith("/ping") or low.startswith("/status"):
-        reply_telegram(cfg, "\n".join(["📊 Работаю, слежу за домашками ProductStar."]
-                                    + _status_lines()))
+        reply(cfg, "\n".join(["📊 Работаю, слежу за домашками ProductStar."]
+                          + _status_lines()), channel)
     elif low.startswith("/cookie") or low.startswith("curl "):
         payload = t[len("/cookie"):].strip() if low.startswith("/cookie") else t
-        update_cookies_from_text(cfg, payload)
+        update_cookies_from_text(cfg, payload, channel)
     # прочее молча игнорируем
 
 
@@ -562,11 +566,70 @@ def telegram_listener(cfg):
                 chat = str(msg.get("chat", {}).get("id"))
                 if chat != allowed:
                     continue  # команды принимаем ТОЛЬКО от тебя
-                handle_command(cfg, msg.get("text", ""))
+                handle_command(cfg, msg.get("text", ""), "telegram")
         except requests.RequestException:
             time.sleep(5)
         except Exception as e:
             log(f"Ошибка Telegram-листенера: {e}")
+            time.sleep(5)
+
+
+def _max_message(upd):
+    """Из апдейта МАКС достаёт (chat_id, текст). Не сообщение -> (None, None)."""
+    if not isinstance(upd, dict):
+        return None, None
+    if upd.get("update_type") not in (None, "message_created"):
+        return None, None
+    msg = upd.get("message") or {}
+    text = _dig(msg, "body", "text")
+    chat = _dig(msg, "recipient", "chat_id")
+    if text is None:                      # запасные пути на случай другой раскладки
+        text = _dig(upd, "body", "text") or _dig(upd, "message", "text")
+    if chat is None:
+        chat = upd.get("chat_id") or _dig(msg, "chat", "chat_id")
+    if text is None or chat is None:
+        return None, None
+    return str(chat), text
+
+
+def max_listener(cfg):
+    """Фоновый поток: слушает команды в МАКС (аналог telegram_listener)."""
+    token = cfg.get("max_token")
+    allowed = str(cfg.get("max_chat_id") or "")
+    if not token or "СЮДА" in str(token) or not allowed:
+        log("Канал МАКС выбран, но max_token/max_chat_id не заполнены — команды слушать некому.")
+        return
+    base = (cfg.get("max_api_base") or MAX_API_BASE).rstrip("/")
+    marker = None
+    first = True   # первый ответ — только запоминаем marker,
+                   # чтобы не выполнить старую команду после перезапуска
+    log("Слушаю команды в МАКС: /cookie, /ping, /status.")
+    while True:
+        try:
+            params = {"timeout": 50, "limit": 100}
+            if marker is not None:
+                params["marker"] = marker
+            r = requests.get(f"{base}/updates", params=params,
+                             headers={"Authorization": str(token)}, timeout=70)
+            if r.status_code != 200:
+                log(f"МАКС /updates {r.status_code}: {r.text[:200]}")
+                time.sleep(15)
+                continue
+            data = r.json()
+            marker = data.get("marker", marker)
+            updates = data.get("updates") or []
+            if first:
+                first = False
+                continue
+            for upd in updates:
+                chat, text = _max_message(upd)
+                if text is None or chat != allowed:
+                    continue   # команды принимаем ТОЛЬКО от тебя
+                handle_command(cfg, text, "max")
+        except requests.RequestException:
+            time.sleep(5)
+        except Exception as e:
+            log(f"Ошибка МАКС-листенера: {e}")
             time.sleep(5)
 
 
@@ -714,9 +777,14 @@ def main():
         log(f"Мониторю: {STATE['method']} {STATE['url']}")
     log(f"Интервал: {interval} сек. Каналы: {cfg.get('channels')}. Ctrl+C для остановки.")
 
-    # Фоновый слушатель команд управления (замена кук с телефона)
-    if "telegram" in (cfg.get("channels") or ["telegram"]):
+    # Фоновые слушатели команд (замена кук с телефона) — по одному на канал
+    channels = cfg.get("channels") or ["telegram"]
+    if isinstance(channels, str):
+        channels = [channels]
+    if "telegram" in channels:
         threading.Thread(target=telegram_listener, args=(cfg,), daemon=True).start()
+    if "max" in channels:
+        threading.Thread(target=max_listener, args=(cfg,), daemon=True).start()
 
     # Стартовое уведомление — заодно проверка, что каналы настроены
     started_at = msk_now()
