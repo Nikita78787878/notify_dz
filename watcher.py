@@ -28,6 +28,9 @@ import requests
 # Иркутское время — UTC+8, круглый год (без переходов на летнее время)
 IRKUTSK_TZ = timezone(timedelta(hours=8))
 
+# Московское время — UTC+3 (ежедневный отчёт «я жив» шлём по нему)
+MSK_TZ = timezone(timedelta(hours=3))
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 CURL_PATH = os.path.join(HERE, "request.curl")
@@ -35,6 +38,7 @@ STATE_PATH = os.path.join(HERE, "seen.json")
 RAWDUMP_PATH = os.path.join(HERE, "last_response.txt")
 COOKIES_PATH = os.path.join(HERE, "cookies.json")
 LOG_PATH = os.path.join(HERE, "watcher.log")
+DAILY_PATH = os.path.join(HERE, "daily_report.txt")  # дата последнего ежедневного отчёта
 
 # Единая HTTP-сессия: сама подхватывает свежие куки из ответов сайта
 # (за счёт remember_web ручная замена нужна очень редко).
@@ -43,6 +47,9 @@ SESSION = requests.Session()
 # Текущий запрос к сайту (обновляется при замене кук через бота).
 STATE = {"url": None, "method": "GET", "headers": {}, "data": None}
 STATE_LOCK = threading.Lock()
+
+# Состояние самого процесса — для отчётов «жив-здоров» и команды /status.
+RUNTIME = {"started_at": None, "last_ok": None}
 
 # --- Логирование: в файл с ротацией (5 × 10 МБ) + в консоль/journald ---
 def _irkutsk_time(timestamp):
@@ -522,12 +529,9 @@ def update_cookies_from_text(cfg, payload):
 def handle_command(cfg, text):
     t = (text or "").strip()
     low = t.lower()
-    if low.startswith("/ping"):
-        reply_telegram(cfg, "🏓 На связи, слежу за домашками.")
-    elif low.startswith("/status"):
-        seen = load_seen()
-        n = 0 if seen is None else len(seen)
-        reply_telegram(cfg, f"📊 Работаю. Известных заданий в памяти: {n}.")
+    if low.startswith("/ping") or low.startswith("/status"):
+        reply_telegram(cfg, "\n".join(["📊 Работаю, слежу за домашками ProductStar."]
+                                    + _status_lines()))
     elif low.startswith("/cookie") or low.startswith("curl "):
         payload = t[len("/cookie"):].strip() if low.startswith("/cookie") else t
         update_cookies_from_text(cfg, payload)
@@ -564,6 +568,102 @@ def telegram_listener(cfg):
         except Exception as e:
             log(f"Ошибка Telegram-листенера: {e}")
             time.sleep(5)
+
+
+# --- Ежедневный отчёт «жив-здоров» ---------------------------------------
+
+def msk_now():
+    """Текущее московское время."""
+    return datetime.now(MSK_TZ)
+
+
+def _daily_time(cfg):
+    """Во сколько по Москве слать отчёт. Формат в конфиге: "09:00"."""
+    raw = str(cfg.get("daily_report_time", "09:00")).strip()
+    m = re.match(r"^(\d{1,2})[:.](\d{2})$", raw)
+    if not m:
+        return 9, 0
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return 9, 0
+    return h, mi
+
+
+def _daily_mark_read():
+    try:
+        with open(DAILY_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _daily_mark_write(day):
+    try:
+        with open(DAILY_PATH, "w", encoding="utf-8") as f:
+            f.write(day)
+    except Exception as e:
+        log(f"Не смог записать {DAILY_PATH}: {e}")
+
+
+def _human_uptime(started_at):
+    """'3 дн. 4 ч.' / '5 ч. 20 мин.' — сколько watcher работает без перезапуска."""
+    total = int((msk_now() - started_at).total_seconds())
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days} дн. {hours} ч."
+    if hours:
+        return f"{hours} ч. {minutes} мин."
+    return f"{minutes} мин."
+
+
+def _status_lines(with_uptime=True):
+    """Общий «паспорт состояния» для стартового, ежедневного и /status."""
+    seen = load_seen()
+    lines = [f"Заданий в памяти: {0 if seen is None else len(seen)}"]
+    last_ok = RUNTIME.get("last_ok")
+    if last_ok:
+        lines.append(f"Последняя удачная проверка: {last_ok.strftime('%H:%M')} МСК")
+    started_at = RUNTIME.get("started_at")
+    if with_uptime and started_at:
+        lines.append(f"Работаю без перезапуска: {_human_uptime(started_at)}")
+    return lines
+
+
+def init_daily_mark(cfg):
+    """
+    Вызывается на старте. Если время отчёта на сегодня уже прошло — считаем
+    отчёт за сегодня закрытым: стартовое сообщение и так только что ушло,
+    второе такое же сразу после запуска не нужно.
+    """
+    now = msk_now()
+    h, mi = _daily_time(cfg)
+    if (now.hour, now.minute) >= (h, mi) and _daily_mark_read() != now.strftime("%Y-%m-%d"):
+        _daily_mark_write(now.strftime("%Y-%m-%d"))
+
+
+def maybe_daily_report(cfg):
+    """Раз в сутки после назначенного времени по Москве шлёт «я жив»."""
+    if not cfg.get("daily_report", True):
+        return
+    now = msk_now()
+    today = now.strftime("%Y-%m-%d")
+    if _daily_mark_read() == today:
+        return
+    h, mi = _daily_time(cfg)
+    if (now.hour, now.minute) < (h, mi):
+        return
+    text = "\n".join(
+        [f"✅ Watcher жив-здоров — {now.strftime('%d.%m')} в {now.strftime('%H:%M')} МСК.",
+         "Слежу за новыми домашками на ProductStar."]
+        + _status_lines()
+    )
+    if notify(cfg, text):
+        _daily_mark_write(today)   # отметку ставим, только если сообщение ушло
+        log("Отправлен ежедневный отчёт «жив-здоров».")
+    else:
+        log("Ежедневный отчёт не ушёл ни в один канал — повторю на следующем цикле.")
 
 
 def build_message(header, title, link):
@@ -619,10 +719,23 @@ def main():
         threading.Thread(target=telegram_listener, args=(cfg,), daemon=True).start()
 
     # Стартовое уведомление — заодно проверка, что каналы настроены
-    if notify(cfg, "✅ Watcher запущен. Слежу за новыми домашками на ProductStar."):
+    started_at = msk_now()
+    RUNTIME["started_at"] = started_at
+    rep_h, rep_m = _daily_time(cfg)
+    start_text = "\n".join(
+        [f"✅ Watcher запущен — {started_at.strftime('%d.%m')} в {started_at.strftime('%H:%M')} МСК.",
+         "Слежу за новыми домашками на ProductStar."]
+        + _status_lines(with_uptime=False)
+        + ([f"Ежедневный отчёт «жив-здоров» — в {rep_h:02d}:{rep_m:02d} МСК."]
+           if cfg.get("daily_report", True) else [])
+    )
+    if notify(cfg, start_text):
         log("Стартовое сообщение отправлено.")
     else:
         log("ВНИМАНИЕ: стартовое сообщение не ушло ни в один канал — проверь настройки.")
+    # Сегодняшний ежедневный отчёт закрываем стартовым сообщением,
+    # чтобы сразу после перезапуска не приходило второе такое же.
+    init_daily_mark(cfg)
 
     fail_streak = 0
     idle_ticks = 0
@@ -630,6 +743,8 @@ def main():
     idle_every = max(1, int(600 / max(interval, 1)))  # примерно раз в 10 минут
     while True:
         try:
+            maybe_daily_report(cfg)
+
             resp = fetch()  # берёт актуальный запрос из STATE через сессию
             ct = resp.headers.get("Content-Type", "")
 
@@ -653,6 +768,7 @@ def main():
                 continue
 
             fail_streak = 0
+            RUNTIME["last_ok"] = msk_now()
             save_cookies()  # запоминаем свежие куки, если сайт их обновил
             items = extract_items(resp.text, ct)
             if items is None:

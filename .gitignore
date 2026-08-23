@@ -5,6 +5,9 @@ cookies.json
 last_response.txt
 PS_COOKIE.txt
 
+# локальное состояние (не коммитим, чтобы git pull на сервере не конфликтовал)
+daily_report.txt
+
 # логи
 *.log
 watcher.log*
