@@ -20,6 +20,7 @@ import os
 import sys
 import threading
 import logging
+import traceback
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, timedelta
 
@@ -53,8 +54,17 @@ QUIET_HOURS_DEFAULT = "00:00-08:00"
 MIN_INTERVAL = 5
 
 # Сколько раз подряд лёгкий запрос может не сработать, прежде чем
-# переходим обратно на полную страницу до перезапуска.
+# на время переходим обратно на полную страницу.
 PARTIAL_MAX_FAILS = 3
+PARTIAL_RETRY_MINUTES = 60   # через сколько снова пробовать лёгкий запрос
+
+# Сторож: если столько минут подряд не было ни одной успешной проверки —
+# пишем в мессенджер. Ночной режим сюда не входит.
+# Переопределяется в config.json: "watchdog_minutes": 5.
+WATCHDOG_MINUTES = 5
+
+# Одну и ту же проблему пишем в лог не чаще, чем раз в столько секунд.
+PROBLEM_LOG_EVERY = 600
 
 # Единая HTTP-сессия: сама подхватывает свежие куки из ответов сайта
 # (за счёт remember_web ручная замена нужна очень редко).
@@ -65,11 +75,15 @@ STATE = {"url": None, "method": "GET", "headers": {}, "data": None}
 STATE_LOCK = threading.Lock()
 
 # Состояние самого процесса — для отчётов «жив-здоров» и команды /status.
-RUNTIME = {"started_at": None, "last_ok": None, "quiet": None}
+RUNTIME = {"started_at": None, "last_ok": None, "quiet": None,
+           # текущий сбой: текст, с какого момента, отправлено ли оповещение
+           "problem": None, "problem_since": None, "problem_logged": None,
+           "problem_auth": False, "alerted": False}
 
 # Что знаем о странице Inertia. version/component приходят с полной страницы
 # и нужны, чтобы просить у сайта только список домашек, без HTML.
-INERTIA = {"version": None, "component": None, "partial_on": True, "fails": 0}
+INERTIA = {"version": None, "component": None, "partial_on": True, "fails": 0,
+           "retry_at": None}
 
 # Кэш seen.json в памяти: файл читается один раз при старте, а пишется
 # только когда что-то изменилось (новые задания или смена суток).
@@ -232,13 +246,14 @@ def extract_items(text, content_type):
     """
     page = _load_inertia_page(text)
     if page is not None:
-        _remember_inertia(page)
         props = page.get("props", {}) if isinstance(page, dict) else {}
         items = _items_from_paginator(props.get("dataPaginator"))
         if items is not None:
+            # запоминаем только страницу со списком — не страницу входа
+            _remember_inertia(page)
             return items
-        # data-page есть, но dataPaginator не нашли — сообщим отладочно
-        log("В data-page не найден dataPaginator — структура изменилась?")
+        # data-page есть, но dataPaginator не нашли — о проблеме сообщит
+        # главный цикл (с ограничением частоты, чтобы не засорять лог)
 
     # --- Fallback: JSON целиком (вдруг это Inertia-XHR ответ) ---
     stripped = text.strip()
@@ -262,7 +277,6 @@ def extract_items(text, content_type):
     # --- Крайний fallback: не смогли разобрать структуру ---
     # Возвращаем "сырой" маркер, только если это НЕ похоже на нормальную
     # пустую страницу (чтобы не слать ложные уведомления).
-    log("Не удалось найти dataPaginator ни в data-page, ни в JSON.")
     return None
 
 
@@ -283,6 +297,25 @@ def _remember_inertia(page):
         INERTIA["version"] = str(page["version"])
     if page.get("component"):
         INERTIA["component"] = str(page["component"])
+
+
+def reset_light_request():
+    """Начать лёгкие запросы с чистого листа (например, после /cookie)."""
+    INERTIA.update(version=None, partial_on=True, fails=0, retry_at=None)
+
+
+def looks_logged_out(resp):
+    """
+    Сайт отправил на страницу входа — значит, сессия слетела.
+    Laravel обычно не отвечает 401, а перенаправляет на /login, и мы
+    получаем страницу входа с кодом 200. Ловим и это, и 419 (истекла сессия),
+    и вариант Inertia — 409 с X-Inertia-Location на /login.
+    """
+    if resp.status_code in (401, 419):
+        return True
+    if resp.status_code == 409 and "/login" in resp.headers.get("X-Inertia-Location", ""):
+        return True
+    return bool(resp.history) and "/login" in resp.url
 
 
 def _replace_headers(base, extra):
@@ -341,13 +374,22 @@ def fetch_homeworks():
       - версия страницы ещё неизвестна (первый цикл после старта);
       - сайт обновили (HTTP 409 — штатный ответ Inertia на старую версию);
       - лёгкий ответ почему-то не подошёл.
-    Если лёгкий запрос не срабатывает PARTIAL_MAX_FAILS раз подряд,
-    выключаем его до перезапуска, чтобы не делать по два запроса за цикл.
+    Если сайт отвечает 200, но лёгкий ответ не тот PARTIAL_MAX_FAILS раз
+    подряд, выключаем его на PARTIAL_RETRY_MINUTES, чтобы не делать по два
+    запроса за цикл. Ошибки самого сайта (5xx, 429...) неудачей лёгкого
+    запроса не считаются: полная страница в этот момент тоже не поможет.
     """
+    if (not INERTIA["partial_on"] and INERTIA["retry_at"]
+            and msk_now() >= INERTIA["retry_at"]):
+        INERTIA.update(partial_on=True, fails=0, retry_at=None)
+        log("Снова пробую лёгкий запрос.")
+
     if INERTIA["partial_on"] and INERTIA["version"] and INERTIA["component"]:
         resp = _fetch_partial()
-        if resp.status_code in (401, 403):
+        if resp.status_code in (401, 403) or looks_logged_out(resp):
             return resp, None  # авторизацию разбирает главный цикл
+        if resp.status_code not in (200, 409):
+            return resp, None  # сайт болеет — разбирает главный цикл
         items = _items_from_partial(resp)
         if items is not None:
             INERTIA["fails"] = 0
@@ -361,11 +403,13 @@ def fetch_homeworks():
                 f"беру полную страницу. Неудач подряд: {INERTIA['fails']}.")
             if INERTIA["fails"] >= PARTIAL_MAX_FAILS:
                 INERTIA["partial_on"] = False
-                log("Лёгкий запрос отключён до перезапуска — работаю полной страницей.")
+                INERTIA["retry_at"] = msk_now() + timedelta(minutes=PARTIAL_RETRY_MINUTES)
+                log(f"Лёгкий запрос отключён на {PARTIAL_RETRY_MINUTES} мин — "
+                    f"работаю полной страницей.")
         INERTIA["version"] = None
 
     resp = fetch()
-    if resp.status_code != 200:
+    if resp.status_code != 200 or looks_logged_out(resp):
         return resp, None
     return resp, extract_items(resp.text, resp.headers.get("Content-Type", ""))
 
@@ -732,6 +776,7 @@ def update_cookies_from_text(cfg, payload, channel="telegram"):
             SESSION.cookies.clear()
             apply_request_from_curl()
             save_cookies()
+            reset_light_request()
             reply(cfg, "✅ Куки обновлены (полный cURL). Продолжаю слежение.", channel)
             log("Куки обновлены через бота (cURL).")
         elif looks_like_cookies:
@@ -739,6 +784,7 @@ def update_cookies_from_text(cfg, payload, channel="telegram"):
             for k, v in _cookies_from_header(cookie_only).items():
                 SESSION.cookies.set(k, v, domain="hr.productstar.ru")
             save_cookies()
+            reset_light_request()
             reply(cfg, "✅ Куки обновлены (строка Cookie). Продолжаю слежение.", channel)
             log("Куки обновлены через бота (cookie-строка).")
         else:
@@ -912,6 +958,9 @@ def _status_lines(with_uptime=True):
     started_at = RUNTIME.get("started_at")
     if with_uptime and started_at:
         lines.append(f"Работаю без перезапуска: {_human_uptime(started_at)}")
+    problem, since = RUNTIME.get("problem"), RUNTIME.get("problem_since")
+    if problem and since:
+        lines.append(f"⚠️ Не получается проверить сайт с {since.strftime('%H:%M')} МСК: {problem}")
     quiet = RUNTIME.get("quiet")
     if is_quiet(quiet):
         lines.append(f"😴 Ночной режим — сайт не проверяю до {_hhmm(quiet[1])} по Иркутску.")
@@ -953,6 +1002,80 @@ def maybe_daily_report(cfg):
         log("Ежедневный отчёт не ушёл ни в один канал — повторю на следующем цикле.")
 
 
+def report_problem(text, detail=None, auth=False):
+    """
+    Запоминает текущий сбой. В лог пишет при первом появлении и смене текста,
+    а дальше — раз в PROBLEM_LOG_EVERY секунд, чтобы при сбое не было
+    одинаковой строки каждые 10 секунд. detail (например, трейсбек) пишется
+    вместе с текстом, но на сравнение «та же ли проблема» не влияет.
+    """
+    now = msk_now()
+    if RUNTIME["problem_since"] is None:
+        RUNTIME["problem_since"] = now
+    logged = RUNTIME["problem_logged"]
+    if (text != RUNTIME["problem"] or logged is None
+            or (now - logged).total_seconds() >= PROBLEM_LOG_EVERY):
+        log(text + (f"\n{detail}" if detail else ""))
+        RUNTIME["problem_logged"] = now
+    RUNTIME["problem"] = text
+    RUNTIME["problem_auth"] = auth
+
+
+def report_ok(cfg):
+    """Успешная проверка: снимает сбой и, если было оповещение, пишет «всё в порядке»."""
+    now = msk_now()
+    RUNTIME["last_ok"] = now
+    if RUNTIME["alerted"]:
+        since = RUNTIME["problem_since"] or now
+        mins = max(1, int((now - since).total_seconds() // 60))
+        notify(cfg, f"✅ Снова проверяю сайт, всё в порядке. Перерыв был ~{mins} мин.")
+        log(f"Сайт снова в порядке после перерыва ~{mins} мин.")
+    elif RUNTIME["problem"]:
+        log("Сайт снова в порядке.")
+    RUNTIME.update(problem=None, problem_since=None, problem_logged=None,
+                   problem_auth=False, alerted=False)
+
+
+def check_watchdog(cfg, minutes):
+    """Шлёт одно оповещение, если сбой длится дольше minutes минут."""
+    since = RUNTIME["problem_since"]
+    if since is None or RUNTIME["alerted"]:
+        return
+    if (msk_now() - since).total_seconds() < minutes * 60:
+        return
+    lines = [f"⚠️ Уже {minutes} мин. не могу проверить сайт ProductStar.",
+             f"Причина: {RUNTIME['problem']}"]
+    last_ok = RUNTIME.get("last_ok")
+    if last_ok:
+        lines.append(f"Последняя удачная проверка: {last_ok.strftime('%H:%M')} МСК.")
+    if RUNTIME["problem_auth"]:
+        lines.append("Похоже на слетевшую авторизацию: пришли боту /cookie со свежим cURL.")
+    lines.append("Когда заработает — напишу.")
+    notify(cfg, "\n".join(lines))
+    log(f"Сторож: отправил оповещение о сбое ({RUNTIME['problem']}).")
+    RUNTIME["alerted"] = True
+
+
+def alert_logged_out(cfg):
+    """Выход из аккаунта — сообщаем сразу, ждать бессмысленно: сам не починится."""
+    if RUNTIME["alerted"]:
+        return
+    notify(cfg, "⚠️ Слетела авторизация на ProductStar — сайт отправляет на страницу входа.\n"
+                "Скопируй свежий Copy as cURL (bash) и пришли боту:\n"
+                "/cookie <вставь сюда>\n"
+                "Когда заработает — напишу.")
+    RUNTIME["alerted"] = True
+
+
+def _retry_after(resp, interval):
+    """Сколько ждать после 429: по заголовку Retry-After, но от interval до 10 минут."""
+    try:
+        sec = int(resp.headers.get("Retry-After", ""))
+    except ValueError:
+        sec = 60
+    return min(600, max(interval, sec))
+
+
 def build_message(header, title, link):
     """Собирает уведомление обычным текстом (работает и в Telegram, и в ВК)."""
     # header=None — без шапки: первая строка задания уже с 🔔
@@ -971,6 +1094,9 @@ def run_test(cfg, url, method, headers, data, page_link):
         f.write(resp.text)
     log(f"HTTP {resp.status_code}")
     items = extract_items(resp.text, resp.headers.get("Content-Type", ""))
+    if items is None:
+        log("Не смог распознать список заданий — смотри last_response.txt.")
+        return
     if not items:
         notify(cfg, "🧪 Проверка: сейчас на сайте нет заданий (Всего: 0), "
                     "но связь работает.")
@@ -986,6 +1112,7 @@ def main():
     cfg = load_config()
     interval = max(MIN_INTERVAL, int(cfg.get("interval_seconds", 10)))
     RUNTIME["quiet"] = _parse_quiet(cfg.get("quiet_hours", QUIET_HOURS_DEFAULT))
+    watchdog = max(1, int(cfg.get("watchdog_minutes", WATCHDOG_MINUTES)))
     page_link = cfg.get("homeworks_url", "https://hr.productstar.ru/homeworks")
 
     # Готовим запрос + сессию (куки уходят в жар сессии, дальше она их обновляет)
@@ -1036,12 +1163,12 @@ def main():
     # чтобы сразу после перезапуска не приходило второе такое же.
     init_daily_mark(cfg)
 
-    fail_streak = 0
     idle_ticks = 0
     sleeping = False
     # "Без изменений" пишем не каждый раз, а раз в ~N циклов (чтобы не спамить лог)
     idle_every = max(1, int(600 / max(interval, 1)))  # примерно раз в 10 минут
     while True:
+        pause = interval
         try:
             maybe_daily_report(cfg)
 
@@ -1055,87 +1182,94 @@ def main():
             if sleeping:
                 log("Ночной режим закончился — возобновляю проверки.")
                 sleeping = False
+                # ночь в сбой не засчитываем: отсчёт сторожа — заново с утра
+                if RUNTIME["problem_since"] is not None:
+                    RUNTIME["problem_since"] = msk_now()
 
             resp, items = fetch_homeworks()
 
             with open(RAWDUMP_PATH, "w", encoding="utf-8") as f:
                 f.write(resp.text)
 
-            if resp.status_code in (401, 403):
-                log(f"Похоже, слетела авторизация (HTTP {resp.status_code}). "
-                    f"Пришли боту команду /cookie с новым cURL.")
-                if fail_streak == 0:
-                    notify(cfg, "⚠️ Слетела авторизация на ProductStar.\n"
-                                "Скопируй свежий Copy as cURL (bash) и пришли боту:\n"
-                                "/cookie <вставь сюда>")
-                fail_streak += 1
-                time.sleep(interval)
-                continue
-
-            if resp.status_code != 200:
-                log(f"HTTP {resp.status_code}, пропускаю.")
-                time.sleep(interval)
-                continue
-
-            fail_streak = 0
-            RUNTIME["last_ok"] = msk_now()
-            save_cookies()  # запоминаем свежие куки, если сайт их обновил
-            if items is None:
-                log("Не смог распознать список заданий — пропускаю цикл. "
-                    "Проверь last_response.txt.")
-                time.sleep(interval)
-                continue
-            current_ids = {i[0] for i in items}
-            titles = {i[0]: i[1] for i in items}
-            links = {i[0]: (i[2] if len(i) > 2 else None) for i in items}
-
-            seen = get_seen()
-            if seen is None:
-                set_seen(current_ids)
-                log(f"Первый запуск. Запомнил {len(current_ids)} заданий. Жду новых...")
-                time.sleep(interval)
-                continue
-
-            new_ids = current_ids - seen.keys()
-            if new_ids:
-                idle_ticks = 0
-                log(f"🔔 НОВЫХ ЗАДАНИЙ: {len(new_ids)}")
-                for nid in new_ids:
-                    title = (titles.get(nid) or "").strip()
-                    link = links.get(nid) or page_link
-                    msg = build_message(None, title, link)
-                    notify(cfg, msg)
+            if looks_logged_out(resp):
+                report_problem(f"Слетела авторизация — сайт отправляет на вход "
+                               f"(HTTP {resp.status_code}). Нужен /cookie.", auth=True)
+                alert_logged_out(cfg)
+            elif resp.status_code == 403:
+                report_problem("Сайт ответил 403: доступ запрещён — либо слетела "
+                               "авторизация, либо сайт ограничил доступ.", auth=True)
+            elif resp.status_code == 429:
+                pause = _retry_after(resp, interval)
+                report_problem(f"Сайт просит сбавить темп (HTTP 429), жду {pause} сек.")
+            elif resp.status_code != 200:
+                report_problem(f"Сайт ответил HTTP {resp.status_code}.")
+            elif items is None:
+                report_problem("Не смог распознать список заданий — структура страницы "
+                               "изменилась? Смотри last_response.txt.")
             else:
-                # пишем «всё тихо» редко, чтобы лог не засорять
-                idle_ticks += 1
-                if idle_ticks % idle_every == 0:
-                    log(f"Работаю, без изменений ({len(current_ids)} заданий).")
-
-            # Отмечаем сегодняшней датой всё, что сейчас висит на сайте.
-            # Пока задание в списке — оно не состарится и не будет забыто.
-            stamp = _seen_stamp()
-            changed = False
-            for iid in current_ids:
-                if seen.get(iid) != stamp:
-                    seen[iid] = stamp
-                    changed = True
-
-            # Пишем на диск, только если что-то поменялось: новые задания или
-            # наступили новые сутки. В обычном цикле записи не происходит.
-            if changed:
-                seen, dropped = prune_seen(seen)
-                if dropped:
-                    log(f"Забыл {dropped} заданий, которых не было на сайте "
-                        f"дольше {SEEN_TTL_DAYS} дн. Осталось: {len(seen)}.")
-                set_seen(seen)
+                save_cookies()  # запоминаем свежие куки, если сайт их обновил
+                report_ok(cfg)
+                idle_ticks = _process_items(cfg, items, page_link, idle_ticks, idle_every)
 
         except requests.RequestException as e:
-            log(f"Сетевая ошибка: {e}")
+            report_problem(f"Сетевая ошибка: {type(e).__name__}.", detail=str(e))
         except Exception as e:
-            log(f"Ошибка: {e}")
+            report_problem(f"Ошибка в коде: {type(e).__name__}: {e}",
+                           detail=traceback.format_exc().rstrip())
 
-        time.sleep(interval)
+        try:
+            check_watchdog(cfg, watchdog)
+        except Exception as e:
+            log(f"Сторож упал: {e}\n{traceback.format_exc().rstrip()}")
 
+        time.sleep(pause)
+
+
+def _process_items(cfg, items, page_link, idle_ticks, idle_every):
+    """Сравнивает список с памятью, шлёт уведомления о новых. Возвращает idle_ticks."""
+    current_ids = {i[0] for i in items}
+    titles = {i[0]: i[1] for i in items}
+    links = {i[0]: (i[2] if len(i) > 2 else None) for i in items}
+
+    seen = get_seen()
+    if seen is None:
+        set_seen(current_ids)
+        log(f"Первый запуск. Запомнил {len(current_ids)} заданий. Жду новых...")
+        return idle_ticks
+
+    new_ids = current_ids - seen.keys()
+    if new_ids:
+        idle_ticks = 0
+        log(f"🔔 НОВЫХ ЗАДАНИЙ: {len(new_ids)}")
+        for nid in new_ids:
+            title = (titles.get(nid) or "").strip()
+            link = links.get(nid) or page_link
+            msg = build_message(None, title, link)
+            notify(cfg, msg)
+    else:
+        # пишем «всё тихо» редко, чтобы лог не засорять
+        idle_ticks += 1
+        if idle_ticks % idle_every == 0:
+            log(f"Работаю, без изменений ({len(current_ids)} заданий).")
+
+    # Отмечаем сегодняшней датой всё, что сейчас висит на сайте.
+    # Пока задание в списке — оно не состарится и не будет забыто.
+    stamp = _seen_stamp()
+    changed = False
+    for iid in current_ids:
+        if seen.get(iid) != stamp:
+            seen[iid] = stamp
+            changed = True
+
+    # Пишем на диск, только если что-то поменялось: новые задания или
+    # наступили новые сутки. В обычном цикле записи не происходит.
+    if changed:
+        seen, dropped = prune_seen(seen)
+        if dropped:
+            log(f"Забыл {dropped} заданий, которых не было на сайте "
+                f"дольше {SEEN_TTL_DAYS} дн. Осталось: {len(seen)}.")
+        set_seen(seen)
+    return idle_ticks
 
 if __name__ == "__main__":
     try:
