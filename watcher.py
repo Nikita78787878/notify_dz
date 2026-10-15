@@ -40,6 +40,10 @@ COOKIES_PATH = os.path.join(HERE, "cookies.json")
 LOG_PATH = os.path.join(HERE, "watcher.log")
 DAILY_PATH = os.path.join(HERE, "daily_report.txt")  # дата последнего ежедневного отчёта
 
+# Сколько дней помним задание, которого больше нет на сайте.
+# Пока задание висит в списке — дата обновляется, и оно не выбрасывается.
+SEEN_TTL_DAYS = 30
+
 # Единая HTTP-сессия: сама подхватывает свежие куки из ответов сайта
 # (за счёт remember_web ручная замена нужна очень редко).
 SESSION = requests.Session()
@@ -50,6 +54,11 @@ STATE_LOCK = threading.Lock()
 
 # Состояние самого процесса — для отчётов «жив-здоров» и команды /status.
 RUNTIME = {"started_at": None, "last_ok": None}
+
+# Кэш seen.json в памяти: файл читается один раз при старте, а пишется
+# только когда что-то изменилось (новые задания или смена суток).
+SEEN_MEM = {"data": None}
+SEEN_LOCK = threading.Lock()
 
 # --- Логирование: в файл с ротацией (5 × 10 МБ) + в консоль/journald ---
 def _irkutsk_time(timestamp):
@@ -309,7 +318,7 @@ def _homework_title(hw):
     lesson = _dig(hw, "lesson", "name")
     course = _dig(hw, "course", "name")
     if lesson:
-        parts.append(f"📝 {lesson}")
+        parts.append(f"🔔 {lesson}")
     if course:
         parts.append(f"📚 {course}")
 
@@ -319,11 +328,6 @@ def _homework_title(hw):
     name = " ".join(x for x in (first, last) if x)
     if name:
         parts.append(f"👤 {name}")
-
-    # время сдачи
-    when = hw.get("firstSubmission") or hw.get("lastActivity")
-    if when:
-        parts.append(f"⏰ {when}")
 
     if not parts:
         # неизвестная структура — покажем сырой дамп, чтобы всё равно было видно
@@ -358,16 +362,81 @@ def _walk_json(node, out, depth=0):
             _walk_json(v, out, depth + 1)
 
 
+def _seen_stamp():
+    """Сегодняшняя дата по Москве — ею метим задания, что сейчас на сайте."""
+    return msk_now().strftime("%Y-%m-%d")
+
+
+def _seen_expired(stamp):
+    """True, если задание не встречалось дольше SEEN_TTL_DAYS."""
+    try:
+        day = datetime.strptime(str(stamp), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return False  # непонятная дата — на всякий случай не выбрасываем
+    return (msk_now().date() - day).days > SEEN_TTL_DAYS
+
+
 def load_seen():
-    if os.path.exists(STATE_PATH):
+    """
+    Читает seen.json. Формат — {id: "ГГГГ-ММ-ДД последней встречи"}.
+    Понимает и старый формат (просто список id): тогда датой считается
+    сегодняшний день, чтобы ничего не выбросить раньше срока.
+    Возвращает dict или None (None == первый запуск, истории ещё нет).
+    """
+    if not os.path.exists(STATE_PATH):
+        return None
+    try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return None  # None == первый запуск
+            raw = json.load(f)
+    except Exception as e:
+        log(f"Не смог прочитать seen.json ({e}) — начинаю историю заново.")
+        return None
+
+    if isinstance(raw, list):
+        stamp = _seen_stamp()
+        log(f"seen.json в старом формате — конвертирую ({len(raw)} заданий).")
+        return {str(i): stamp for i in raw}
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+
+    log("seen.json неожиданной структуры — начинаю историю заново.")
+    return None
 
 
-def save_seen(ids):
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(sorted(ids), f, ensure_ascii=False, indent=2)
+def prune_seen(seen):
+    """Выбрасывает задания, которых нет на сайте дольше SEEN_TTL_DAYS."""
+    fresh = {k: v for k, v in seen.items() if not _seen_expired(v)}
+    return fresh, len(seen) - len(fresh)
+
+
+def save_seen(seen):
+    """Пишет seen.json. Принимает и dict, и голый набор id (тогда ставит сегодня)."""
+    if not isinstance(seen, dict):
+        stamp = _seen_stamp()
+        seen = {str(i): stamp for i in seen}
+    # пишем через временный файл, чтобы падение не оставило обрезанный json
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(dict(sorted(seen.items())), f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+
+def get_seen():
+    """seen из памяти; при первом обращении подтягивает с диска."""
+    with SEEN_LOCK:
+        if SEEN_MEM["data"] is None:
+            SEEN_MEM["data"] = load_seen()
+        return SEEN_MEM["data"]
+
+
+def set_seen(seen):
+    """Обновляет и память, и файл."""
+    if not isinstance(seen, dict):
+        stamp = _seen_stamp()
+        seen = {str(i): stamp for i in seen}
+    with SEEN_LOCK:
+        SEEN_MEM["data"] = seen
+    save_seen(seen)
 
 
 def send_telegram(token, chat_id, text):
@@ -683,7 +752,7 @@ def _human_uptime(started_at):
 
 def _status_lines(with_uptime=True):
     """Общий «паспорт состояния» для стартового, ежедневного и /status."""
-    seen = load_seen()
+    seen = get_seen()
     lines = [f"Заданий в памяти: {0 if seen is None else len(seen)}"]
     last_ok = RUNTIME.get("last_ok")
     if last_ok:
@@ -731,7 +800,8 @@ def maybe_daily_report(cfg):
 
 def build_message(header, title, link):
     """Собирает уведомление обычным текстом (работает и в Telegram, и в ВК)."""
-    lines = [header]
+    # header=None — без шапки: первая строка задания уже с 🔔
+    lines = [header] if header else []
     if title:
         lines.append(title)
     return "\n".join(lines)
@@ -848,28 +918,45 @@ def main():
             titles = {i[0]: i[1] for i in items}
             links = {i[0]: (i[2] if len(i) > 2 else None) for i in items}
 
-            seen = load_seen()
+            seen = get_seen()
             if seen is None:
-                save_seen(current_ids)
+                set_seen(current_ids)
                 log(f"Первый запуск. Запомнил {len(current_ids)} заданий. Жду новых...")
                 time.sleep(interval)
                 continue
 
-            new_ids = current_ids - seen
+            new_ids = current_ids - seen.keys()
             if new_ids:
                 idle_ticks = 0
                 log(f"🔔 НОВЫХ ЗАДАНИЙ: {len(new_ids)}")
                 for nid in new_ids:
                     title = (titles.get(nid) or "").strip()
                     link = links.get(nid) or page_link
-                    msg = build_message("🔔 Новое", title, link)
+                    msg = build_message(None, title, link)
                     notify(cfg, msg)
-                save_seen(seen | current_ids)
             else:
                 # пишем «всё тихо» редко, чтобы лог не засорять
                 idle_ticks += 1
                 if idle_ticks % idle_every == 0:
                     log(f"Работаю, без изменений ({len(current_ids)} заданий).")
+
+            # Отмечаем сегодняшней датой всё, что сейчас висит на сайте.
+            # Пока задание в списке — оно не состарится и не будет забыто.
+            stamp = _seen_stamp()
+            changed = False
+            for iid in current_ids:
+                if seen.get(iid) != stamp:
+                    seen[iid] = stamp
+                    changed = True
+
+            # Пишем на диск, только если что-то поменялось: новые задания или
+            # наступили новые сутки. В обычном цикле записи не происходит.
+            if changed:
+                seen, dropped = prune_seen(seen)
+                if dropped:
+                    log(f"Забыл {dropped} заданий, которых не было на сайте "
+                        f"дольше {SEEN_TTL_DAYS} дн. Осталось: {len(seen)}.")
+                set_seen(seen)
 
         except requests.RequestException as e:
             log(f"Сетевая ошибка: {e}")
