@@ -44,6 +44,18 @@ DAILY_PATH = os.path.join(HERE, "daily_report.txt")  # дата последне
 # Пока задание висит в списке — дата обновляется, и оно не выбрасывается.
 SEEN_TTL_DAYS = 30
 
+# Ночной режим: в эти часы сайт не опрашиваем (время — иркутское).
+# Переопределяется в config.json: "quiet_hours": "00:00-08:00";
+# пустая строка "" выключает ночной режим.
+QUIET_HOURS_DEFAULT = "00:00-08:00"
+
+# Нижняя граница интервала опроса — защита от опечатки в config.json.
+MIN_INTERVAL = 5
+
+# Сколько раз подряд лёгкий запрос может не сработать, прежде чем
+# переходим обратно на полную страницу до перезапуска.
+PARTIAL_MAX_FAILS = 3
+
 # Единая HTTP-сессия: сама подхватывает свежие куки из ответов сайта
 # (за счёт remember_web ручная замена нужна очень редко).
 SESSION = requests.Session()
@@ -53,7 +65,11 @@ STATE = {"url": None, "method": "GET", "headers": {}, "data": None}
 STATE_LOCK = threading.Lock()
 
 # Состояние самого процесса — для отчётов «жив-здоров» и команды /status.
-RUNTIME = {"started_at": None, "last_ok": None}
+RUNTIME = {"started_at": None, "last_ok": None, "quiet": None}
+
+# Что знаем о странице Inertia. version/component приходят с полной страницы
+# и нужны, чтобы просить у сайта только список домашек, без HTML.
+INERTIA = {"version": None, "component": None, "partial_on": True, "fails": 0}
 
 # Кэш seen.json в памяти: файл читается один раз при старте, а пишется
 # только когда что-то изменилось (новые задания или смена суток).
@@ -216,12 +232,11 @@ def extract_items(text, content_type):
     """
     page = _load_inertia_page(text)
     if page is not None:
+        _remember_inertia(page)
         props = page.get("props", {}) if isinstance(page, dict) else {}
-        paginator = props.get("dataPaginator")
-        if isinstance(paginator, dict) and "data" in paginator:
-            rows = paginator.get("data") or []
-            return [(_homework_id(hw), _homework_title(hw), _homework_link(hw, None))
-                    for hw in rows]
+        items = _items_from_paginator(props.get("dataPaginator"))
+        if items is not None:
+            return items
         # data-page есть, но dataPaginator не нашли — сообщим отладочно
         log("В data-page не найден dataPaginator — структура изменилась?")
 
@@ -234,10 +249,9 @@ def extract_items(text, content_type):
                 data.get("props", {}).get("dataPaginator")
                 if isinstance(data, dict) else None
             )
-            if isinstance(paginator, dict) and "data" in paginator:
-                rows = paginator.get("data") or []
-                return [(_homework_id(hw), _homework_title(hw), _homework_link(hw, None))
-                        for hw in rows]
+            items = _items_from_paginator(paginator)
+            if items is not None:
+                return items
             found = []
             _walk_json(data, found)
             if found:
@@ -250,6 +264,144 @@ def extract_items(text, content_type):
     # пустую страницу (чтобы не слать ложные уведомления).
     log("Не удалось найти dataPaginator ни в data-page, ни в JSON.")
     return None
+
+
+def _items_from_paginator(paginator):
+    """props.dataPaginator -> [(id, title, link)] или None, если это не он."""
+    if not (isinstance(paginator, dict) and "data" in paginator):
+        return None
+    rows = paginator.get("data") or []
+    return [(_homework_id(hw), _homework_title(hw), _homework_link(hw, None))
+            for hw in rows]
+
+
+def _remember_inertia(page):
+    """Запоминает версию и имя страницы Inertia для следующих лёгких запросов."""
+    if not isinstance(page, dict):
+        return
+    if page.get("version"):
+        INERTIA["version"] = str(page["version"])
+    if page.get("component"):
+        INERTIA["component"] = str(page["component"])
+
+
+def _replace_headers(base, extra):
+    """Накладывает заголовки поверх base без учёта регистра имён."""
+    drop = {k.lower() for k in extra}
+    out = {k: v for k, v in base.items() if k.lower() not in drop}
+    out.update(extra)
+    return out
+
+
+def _fetch_partial():
+    """
+    Лёгкий запрос — штатный механизм Inertia (partial reload). Просим у сайта
+    только props.dataPaginator в JSON: без HTML, профиля и прочего.
+    Ответ ~3 КБ вместо ~45 КБ, сервер при этом не рендерит страницу.
+    """
+    with STATE_LOCK:
+        url, method = STATE["url"], STATE["method"]
+        headers, data = dict(STATE["headers"]), STATE["data"]
+    headers = _replace_headers(headers, {
+        "X-Inertia": "true",
+        "X-Inertia-Version": INERTIA["version"],
+        "X-Inertia-Partial-Component": INERTIA["component"],
+        "X-Inertia-Partial-Data": "dataPaginator",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "text/html, application/xhtml+xml",
+    })
+    return fetch(url, method, headers, data)
+
+
+def _items_from_partial(resp):
+    """
+    Строго разбирает ответ лёгкого запроса: только JSON нужной страницы
+    с dataPaginator, иначе None. Никаких «похожих на задание» объектов —
+    чтобы не принять за домашку, например, собственный профиль.
+    """
+    if resp.status_code != 200:
+        return None
+    try:
+        page = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(page, dict) or page.get("component") != INERTIA["component"]:
+        return None
+    items = _items_from_paginator((page.get("props") or {}).get("dataPaginator"))
+    if items is not None:
+        _remember_inertia(page)
+    return items
+
+
+def fetch_homeworks():
+    """
+    Возвращает (resp, items); items=None — список разобрать не удалось.
+
+    Сначала лёгкий запрос. Полную страницу берём, когда:
+      - версия страницы ещё неизвестна (первый цикл после старта);
+      - сайт обновили (HTTP 409 — штатный ответ Inertia на старую версию);
+      - лёгкий ответ почему-то не подошёл.
+    Если лёгкий запрос не срабатывает PARTIAL_MAX_FAILS раз подряд,
+    выключаем его до перезапуска, чтобы не делать по два запроса за цикл.
+    """
+    if INERTIA["partial_on"] and INERTIA["version"] and INERTIA["component"]:
+        resp = _fetch_partial()
+        if resp.status_code in (401, 403):
+            return resp, None  # авторизацию разбирает главный цикл
+        items = _items_from_partial(resp)
+        if items is not None:
+            INERTIA["fails"] = 0
+            return resp, items
+
+        if resp.status_code == 409:
+            log("Сайт обновился (сменилась версия страницы) — перечитываю полную.")
+        else:
+            INERTIA["fails"] += 1
+            log(f"Лёгкий запрос не подошёл (HTTP {resp.status_code}), "
+                f"беру полную страницу. Неудач подряд: {INERTIA['fails']}.")
+            if INERTIA["fails"] >= PARTIAL_MAX_FAILS:
+                INERTIA["partial_on"] = False
+                log("Лёгкий запрос отключён до перезапуска — работаю полной страницей.")
+        INERTIA["version"] = None
+
+    resp = fetch()
+    if resp.status_code != 200:
+        return resp, None
+    return resp, extract_items(resp.text, resp.headers.get("Content-Type", ""))
+
+
+def _parse_quiet(spec):
+    """'00:00-08:00' -> (0, 480) в минутах от полуночи; пусто или ошибка -> None."""
+    if not spec:
+        return None
+    try:
+        a, b = str(spec).split("-")
+        ah, am = a.strip().split(":")
+        bh, bm = b.strip().split(":")
+        start, end = int(ah) * 60 + int(am), int(bh) * 60 + int(bm)
+    except ValueError:
+        log(f"Не понял quiet_hours={spec!r} (нужно вида 00:00-08:00) — ночной режим выключен.")
+        return None
+    if start == end or not (0 <= start < 1440 and 0 <= end < 1440):
+        log(f"Странный quiet_hours={spec!r} — ночной режим выключен.")
+        return None
+    return start, end
+
+
+def is_quiet(window, now=None):
+    """True, если сейчас ночной режим (по Иркутску). Окно может переходить через полночь."""
+    if not window:
+        return False
+    now = now or datetime.now(IRKUTSK_TZ)
+    t = now.hour * 60 + now.minute
+    start, end = window
+    if start < end:
+        return start <= t < end
+    return t >= start or t < end
+
+
+def _hhmm(minutes):
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 def _load_inertia_page(text):
@@ -760,6 +912,9 @@ def _status_lines(with_uptime=True):
     started_at = RUNTIME.get("started_at")
     if with_uptime and started_at:
         lines.append(f"Работаю без перезапуска: {_human_uptime(started_at)}")
+    quiet = RUNTIME.get("quiet")
+    if is_quiet(quiet):
+        lines.append(f"😴 Ночной режим — сайт не проверяю до {_hhmm(quiet[1])} по Иркутску.")
     return lines
 
 
@@ -829,7 +984,8 @@ def run_test(cfg, url, method, headers, data, page_link):
 
 def main():
     cfg = load_config()
-    interval = cfg.get("interval_seconds", 30)
+    interval = max(MIN_INTERVAL, int(cfg.get("interval_seconds", 10)))
+    RUNTIME["quiet"] = _parse_quiet(cfg.get("quiet_hours", QUIET_HOURS_DEFAULT))
     page_link = cfg.get("homeworks_url", "https://hr.productstar.ru/homeworks")
 
     # Готовим запрос + сессию (куки уходят в жар сессии, дальше она их обновляет)
@@ -846,6 +1002,9 @@ def main():
     with STATE_LOCK:
         log(f"Мониторю: {STATE['method']} {STATE['url']}")
     log(f"Интервал: {interval} сек. Каналы: {cfg.get('channels')}. Ctrl+C для остановки.")
+    quiet = RUNTIME["quiet"]
+    if quiet:
+        log(f"Ночной режим: {_hhmm(quiet[0])}–{_hhmm(quiet[1])} по Иркутску.")
 
     # Фоновые слушатели команд (замена кук с телефона) — по одному на канал
     channels = cfg.get("channels") or ["telegram"]
@@ -862,7 +1021,9 @@ def main():
     rep_h, rep_m = _daily_time(cfg)
     start_text = "\n".join(
         [f"✅ Watcher запущен — {started_at.strftime('%d.%m')} в {started_at.strftime('%H:%M')} МСК.",
-         "Слежу за новыми домашками на ProductStar."]
+         "Слежу за новыми домашками на ProductStar.",
+         f"Проверяю каждые {interval} сек."
+         + (f" Ночью ({_hhmm(quiet[0])}–{_hhmm(quiet[1])} по Иркутску) сплю." if quiet else "")]
         + _status_lines(with_uptime=False)
         + ([f"Ежедневный отчёт «жив-здоров» — в {rep_h:02d}:{rep_m:02d} МСК."]
            if cfg.get("daily_report", True) else [])
@@ -877,14 +1038,25 @@ def main():
 
     fail_streak = 0
     idle_ticks = 0
+    sleeping = False
     # "Без изменений" пишем не каждый раз, а раз в ~N циклов (чтобы не спамить лог)
     idle_every = max(1, int(600 / max(interval, 1)))  # примерно раз в 10 минут
     while True:
         try:
             maybe_daily_report(cfg)
 
-            resp = fetch()  # берёт актуальный запрос из STATE через сессию
-            ct = resp.headers.get("Content-Type", "")
+            # Ночной режим: сайт не трогаем, но команды бота и отчёт работают
+            if is_quiet(quiet):
+                if not sleeping:
+                    log(f"Ночной режим — не проверяю сайт до {_hhmm(quiet[1])} по Иркутску.")
+                    sleeping = True
+                time.sleep(60)
+                continue
+            if sleeping:
+                log("Ночной режим закончился — возобновляю проверки.")
+                sleeping = False
+
+            resp, items = fetch_homeworks()
 
             with open(RAWDUMP_PATH, "w", encoding="utf-8") as f:
                 f.write(resp.text)
@@ -908,7 +1080,6 @@ def main():
             fail_streak = 0
             RUNTIME["last_ok"] = msk_now()
             save_cookies()  # запоминаем свежие куки, если сайт их обновил
-            items = extract_items(resp.text, ct)
             if items is None:
                 log("Не смог распознать список заданий — пропускаю цикл. "
                     "Проверь last_response.txt.")
